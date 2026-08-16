@@ -2,6 +2,9 @@
 // ESP32-C3 Super Mini pump control over MQTT.
 // Register a single active-low relay (pump) as a remote switch capability
 // and accept on/off commands from the AtanStack control topic.
+// Daily automation rules are synced to the device (retained MQTT config) and
+// executed locally on the device clock, so scheduled pump runs keep firing
+// even when the AtanStack broker is unreachable.
 // The built-in LED mirrors the pump state as a local status indicator.
 
 #include <WiFi.h>
@@ -60,12 +63,6 @@ void connectWifi() {
   Serial.println(WiFi.localIP());
 }
 
-bool syncClock() {
-  configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-  struct tm timeInfo;
-  return getLocalTime(&timeInfo, 20000);
-}
-
 void setup() {
   // Preload the inactive level before enabling output to avoid an active-low
   // glitch while Wi-Fi, time, and MQTT initialize.
@@ -80,41 +77,36 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LED_OFF);
 
-  connectWifi();
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-  if (!syncClock()) {
-    Serial.println("clock sync failed; TLS connection stopped");
-    return;
-  }
-
+  // begin() loads any persisted automation rules from flash immediately, so
+  // schedules are armed even before Wi-Fi/clock/broker are available. Connect
+  // and clock sync happen later in loop() via the library.
   if (!atanstack.begin(DEVICE_PID, DEVICE_SECRET)) {
     Serial.print("atanstack: begin failed: ");
     Serial.println(atanstack.lastError());
     return;
   }
 
-  // Register the pump as an active-low relay switch capability.
+  // Register the pump as an active-low relay switch capability. Rules target
+  // this GPIO; it must be registered for local execution to drive the pin.
   if (!atanstack.switchPin(PUMP_PIN, RELAY_ON)) {
     Serial.print("atanstack: switchPin pump gpio 6 failed: ");
     Serial.println(atanstack.lastError());
     return;
   }
 
-  if (!atanstack.connect()) {
-    Serial.print("atanstack: connect failed: ");
-    Serial.println(atanstack.lastError());
-    Serial.print("atanstack: mqtt state=");
-    Serial.println(atanstack.mqttState());
-    return;
-  }
-
-  Serial.println("atanstack: ready for pump commands");
+  Serial.println("atanstack: armed for local schedules, connecting");
 }
 
 void loop() {
+  // Drives MQTT reconnects, NTP clock sync, and local automation schedule
+  // execution. Schedules fire even while the broker is unreachable.
   atanstack.loop();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWifi();
+    delay(1000);
+    return;
+  }
 
   if (!atanstack.connected()) {
     Serial.print("atanstack: waiting reconnect, lastError=");

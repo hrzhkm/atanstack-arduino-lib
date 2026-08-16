@@ -10,8 +10,11 @@
 #include <time.h>
 
 #if defined(ARDUINO_ARCH_ESP32)
+#include <Preferences.h>
 #include <WiFiClientSecure.h>
 #endif
+
+#include "automationSchedule.h"
 
 class AtanstackWebSocketClient : public Client {
  public:
@@ -150,7 +153,7 @@ struct AtanstackConfig {
         clientId(""),
         topicBase("atanstack/v1/devices"),
         webSocketPath("/mqtt"),
-        maxPayloadBytes(512),
+        maxPayloadBytes(1024),
         reconnectIntervalMs(5000) {}
 };
 
@@ -235,6 +238,21 @@ class AtanstackClient {
   };
 
 #if defined(ARDUINO_ARCH_ESP32)
+  static const uint8_t kAutomationRuleMax = 8;
+  struct AutomationRule {
+    char id[40];
+    uint8_t gpio;
+    uint8_t hour;
+    uint8_t minute;
+    bool on;
+    uint32_t lastFired;
+    uint32_t endEpoch;
+    uint32_t durationSeconds;
+    bool endOn;
+  };
+#endif
+
+#if defined(ARDUINO_ARCH_ESP32)
   WiFiClientSecure _defaultNetworkClient;
 #endif
   Client* _networkClient;
@@ -254,6 +272,14 @@ class AtanstackClient {
   SwitchSlot _switchSlots[kSlotCount];
   uint8_t _nextDataSlot;
   uint8_t _nextMetaSlot;
+
+#if defined(ARDUINO_ARCH_ESP32)
+  AutomationRule _automationRules[kAutomationRuleMax];
+  uint8_t _automationRuleCount;
+  String _automationTz;
+  Preferences _automationPrefs;
+  bool _automationPrefsOpen;
+#endif
 
   static void onMqttMessage(char* topic, byte* payload, unsigned int length);
   bool subscribeControlTopic();
@@ -277,6 +303,22 @@ class AtanstackClient {
   void buildTimestamp(String& outTimestamp);
   void ensureClockSynced();
   void setError(const char* message);
+
+#if defined(ARDUINO_ARCH_ESP32)
+  bool buildAutomationTopic(String& outTopic) const;
+  void handleAutomationConfig(byte* payload, unsigned int length);
+  void persistAutomationConfig(const String& raw);
+  void loadAutomationConfig();
+  void openAutomationPrefs(bool write);
+  void applyAutomationTz(const char* tz);
+  void runAutomationSchedule();
+  uint32_t automationLastFired(const char* ruleId);
+  void setAutomationLastFired(const char* ruleId, uint32_t minuteKey);
+  uint32_t automationEndEpoch(const char* ruleId);
+  void setAutomationEndEpoch(const char* ruleId, uint32_t endEpoch);
+  bool publishAutomationFired(const AutomationRule& rule, bool on, const char* phase);
+  bool automationClockSynced() const;
+#endif
 };
 
 template <typename T>

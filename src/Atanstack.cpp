@@ -63,13 +63,26 @@ AtanstackClient::AtanstackClient()
       _lastNtpAttemptMs(0),
       _lastError(""),
       _nextDataSlot(0),
-      _nextMetaSlot(0) {
+      _nextMetaSlot(0),
+      _automationRuleCount(0),
+      _automationPrefsOpen(false) {
   for (uint8_t i = 0; i < kSlotCount; ++i) {
     _dataSlots[i] = nullptr;
     _metaSlots[i] = nullptr;
     _switchSlots[i].gpio = 0;
     _switchSlots[i].activeLevel = LOW;
     _switchSlots[i].used = false;
+  }
+  for (uint8_t i = 0; i < kAutomationRuleMax; ++i) {
+    _automationRules[i].id[0] = '\0';
+    _automationRules[i].gpio = 0;
+    _automationRules[i].hour = 0;
+    _automationRules[i].minute = 0;
+    _automationRules[i].on = false;
+    _automationRules[i].lastFired = 0;
+    _automationRules[i].endEpoch = 0;
+    _automationRules[i].durationSeconds = 0;
+    _automationRules[i].endOn = false;
   }
 }
 
@@ -173,6 +186,9 @@ bool AtanstackClient::begin(const AtanstackConfig& config) {
   _ntpInitAttempted = false;
   _lastNtpAttemptMs = 0;
   _lastError = "";
+#if defined(ARDUINO_ARCH_ESP32)
+  loadAutomationConfig();
+#endif
   return true;
 }
 
@@ -217,10 +233,13 @@ bool AtanstackClient::connect() {
 
 void AtanstackClient::loop() {
   _mqtt.loop();
+  ensureClockSynced();
+#if defined(ARDUINO_ARCH_ESP32)
+  runAutomationSchedule();
+#endif
   unsigned long now = millis();
 
   if (_mqtt.connected()) {
-    ensureClockSynced();
     return;
   }
 
@@ -509,6 +528,18 @@ bool AtanstackClient::subscribeControlTopic() {
     return false;
   }
 
+#if defined(ARDUINO_ARCH_ESP32)
+  String automationTopic;
+  if (!buildAutomationTopic(automationTopic)) {
+    setError("build_automation_topic_failed");
+    return false;
+  }
+  if (!_mqtt.subscribe(automationTopic.c_str())) {
+    setError("subscribe_automation_failed");
+    return false;
+  }
+#endif
+
   return true;
 }
 
@@ -547,6 +578,20 @@ bool AtanstackClient::buildPongTopic(String& outTopic) const {
   outTopic += "/status/pong";
   return true;
 }
+
+#if defined(ARDUINO_ARCH_ESP32)
+bool AtanstackClient::buildAutomationTopic(String& outTopic) const {
+  if (_config.topicBase == nullptr || strlen(_config.topicBase) == 0) {
+    return false;
+  }
+  outTopic.reserve(strlen(_config.topicBase) + strlen(_config.devicePid) + 24);
+  outTopic = _config.topicBase;
+  outTopic += "/";
+  outTopic += _config.devicePid;
+  outTopic += "/control/automation";
+  return true;
+}
+#endif
 
 bool AtanstackClient::publishPong(const char* requestId) {
   if (requestId == nullptr || strlen(requestId) == 0) {
@@ -665,7 +710,21 @@ bool AtanstackClient::applySwitchState(uint8_t gpio, bool on) {
 }
 
 void AtanstackClient::handleMqttMessage(char* topic, byte* payload, unsigned int length) {
-  if (topic == nullptr || payload == nullptr || length == 0) {
+  if (topic == nullptr || payload == nullptr) {
+    return;
+  }
+
+#if defined(ARDUINO_ARCH_ESP32)
+  String automationTopic;
+  if (buildAutomationTopic(automationTopic)) {
+    if (strcmp(topic, automationTopic.c_str()) == 0) {
+      handleAutomationConfig(payload, length);
+      return;
+    }
+  }
+#endif
+
+  if (length == 0) {
     return;
   }
 
@@ -817,11 +876,230 @@ void AtanstackClient::ensureClockSynced() {
     return;
   }
 
+#if defined(ARDUINO_ARCH_ESP32)
+  if (_automationTz.length() > 0) {
+    configTzTime(_automationTz.c_str(), "pool.ntp.org", "time.nist.gov");
+  } else {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  }
+#else
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+#endif
   _ntpInitAttempted = true;
   _lastNtpAttemptMs = nowMs;
 #endif
 }
+
+#if defined(ARDUINO_ARCH_ESP32)
+bool AtanstackClient::automationClockSynced() const {
+  return time(nullptr) >= 946684800;
+}
+
+void AtanstackClient::openAutomationPrefs(bool write) {
+  if (_automationPrefsOpen) {
+    _automationPrefs.end();
+    _automationPrefsOpen = false;
+  }
+  _automationPrefsOpen = _automationPrefs.begin("atan-auto", !write);
+}
+
+void AtanstackClient::applyAutomationTz(const char* tz) {
+  if (tz == nullptr || strlen(tz) == 0) {
+    return;
+  }
+  _automationTz = tz;
+  configTzTime(_automationTz.c_str(), "pool.ntp.org", "time.nist.gov");
+}
+
+void AtanstackClient::persistAutomationConfig(const String& raw) {
+  openAutomationPrefs(true);
+  if (_automationPrefsOpen) {
+    _automationPrefs.putString("cfg", raw);
+  }
+  openAutomationPrefs(false);
+}
+
+void AtanstackClient::loadAutomationConfig() {
+  openAutomationPrefs(false);
+  if (!_automationPrefsOpen) {
+    return;
+  }
+  String raw = _automationPrefs.getString("cfg", "");
+  openAutomationPrefs(false);
+  if (raw.length() == 0) {
+    return;
+  }
+  handleAutomationConfig(reinterpret_cast<byte*>(&raw[0]), raw.length());
+}
+
+void AtanstackClient::handleAutomationConfig(byte* payload, unsigned int length) {
+  _automationRuleCount = 0;
+  if (payload == nullptr || length == 0) {
+    persistAutomationConfig(String());
+    return;
+  }
+
+  DynamicJsonDocument doc(2048);
+  DeserializationError error = deserializeJson(doc, payload, length);
+  if (error) {
+    setError("automation_config_invalid");
+    return;
+  }
+
+  const char* tz = doc["tz"] | "";
+  JsonArray rules = doc["rules"].as<JsonArray>();
+  if (!rules.isNull()) {
+    for (JsonObject rule : rules) {
+      if (_automationRuleCount >= kAutomationRuleMax) {
+        break;
+      }
+      const char* id = rule["id"] | "";
+      const char* timeValue = rule["time"] | "";
+      const char* stateValue = rule["state"] | "";
+      const char* endValue = rule["end"] | "";
+      int gpio = rule["gpio"] | -1;
+      int dur = rule["dur"] | 0;
+      int hour = -1;
+      int minute = -1;
+      if (strlen(id) == 0 || strlen(timeValue) == 0 || gpio < 0 ||
+          sscanf(timeValue, "%d:%d", &hour, &minute) != 2 || hour < 0 ||
+          hour > 23 || minute < 0 || minute > 59 ||
+          (strcmp(stateValue, "on") != 0 && strcmp(stateValue, "off") != 0) ||
+          dur < 0 || (dur > 0 && strcmp(endValue, "on") != 0 &&
+                      strcmp(endValue, "off") != 0)) {
+        continue;
+      }
+      AutomationRule& slot = _automationRules[_automationRuleCount];
+      strncpy(slot.id, id, sizeof(slot.id) - 1);
+      slot.id[sizeof(slot.id) - 1] = '\0';
+      slot.gpio = (uint8_t)gpio;
+      slot.hour = (uint8_t)hour;
+      slot.minute = (uint8_t)minute;
+      slot.on = strcmp(stateValue, "on") == 0;
+      slot.lastFired = automationLastFired(slot.id);
+      slot.durationSeconds = (uint32_t)dur;
+      slot.endOn = strcmp(endValue, "on") == 0;
+      slot.endEpoch = automationEndEpoch(slot.id);
+      ++_automationRuleCount;
+    }
+  }
+
+  applyAutomationTz(tz);
+  persistAutomationConfig(String(reinterpret_cast<char*>(payload), length));
+}
+
+uint32_t AtanstackClient::automationLastFired(const char* ruleId) {
+  openAutomationPrefs(false);
+  if (!_automationPrefsOpen) {
+    return 0;
+  }
+  const uint32_t hash = fnv1aHash(String(ruleId));
+  char key[12];
+  snprintf(key, sizeof(key), "f%08lx", (unsigned long)hash);
+  const uint32_t value = _automationPrefs.getULong(key, 0);
+  openAutomationPrefs(false);
+  return value;
+}
+
+void AtanstackClient::setAutomationLastFired(const char* ruleId,
+                                             uint32_t minuteKey) {
+  openAutomationPrefs(true);
+  if (!_automationPrefsOpen) {
+    return;
+  }
+  const uint32_t hash = fnv1aHash(String(ruleId));
+  char key[12];
+  snprintf(key, sizeof(key), "f%08lx", (unsigned long)hash);
+  _automationPrefs.putULong(key, minuteKey);
+  openAutomationPrefs(false);
+}
+
+uint32_t AtanstackClient::automationEndEpoch(const char* ruleId) {
+  openAutomationPrefs(false);
+  if (!_automationPrefsOpen) {
+    return 0;
+  }
+  const uint32_t hash = fnv1aHash(String(ruleId));
+  char key[12];
+  snprintf(key, sizeof(key), "e%08lx", (unsigned long)hash);
+  const uint32_t value = _automationPrefs.getULong(key, 0);
+  openAutomationPrefs(false);
+  return value;
+}
+
+void AtanstackClient::setAutomationEndEpoch(const char* ruleId,
+                                            uint32_t endEpoch) {
+  openAutomationPrefs(true);
+  if (!_automationPrefsOpen) {
+    return;
+  }
+  const uint32_t hash = fnv1aHash(String(ruleId));
+  char key[12];
+  snprintf(key, sizeof(key), "e%08lx", (unsigned long)hash);
+  _automationPrefs.putULong(key, endEpoch);
+  openAutomationPrefs(false);
+}
+
+bool AtanstackClient::publishAutomationFired(const AutomationRule& rule,
+                                             bool on,
+                                             const char* phase) {
+  JsonObject fired = data("rule_id", String(rule.id));
+  if (fired.isNull()) {
+    return false;
+  }
+  fired["gpio"] = (int)rule.gpio;
+  fired["state"] = on ? "on" : "off";
+  fired["phase"] = phase;
+  return send("automation-fired", fired);
+}
+
+void AtanstackClient::runAutomationSchedule() {
+  if (_automationRuleCount == 0 || !automationClockSynced()) {
+    return;
+  }
+  // ponytail: requires a synced clock this boot; an ESP32 that boots fully
+  // offline (no NTP) keeps persisted rules but cannot fire until it sees a
+  // network once. Add an RTC/NVS epoch backup if boot-while-offline matters.
+
+  const time_t nowEpoch = time(nullptr);
+  struct tm local;
+  localtime_r(&nowEpoch, &local);
+  const uint32_t minuteKey =
+      automationMinuteKey(local.tm_year + 1900, local.tm_yday, local.tm_hour,
+                          local.tm_min);
+
+  for (uint8_t i = 0; i < _automationRuleCount; ++i) {
+    AutomationRule& rule = _automationRules[i];
+
+    if (rule.endEpoch != 0 && automationEndDue((uint32_t)nowEpoch, rule.endEpoch)) {
+      uint8_t slotIndex = 0;
+      if (findSwitchSlotByGpio(rule.gpio, slotIndex)) {
+        applySwitchState(rule.gpio, rule.endOn);
+        publishAutomationFired(rule, rule.endOn, "end");
+      }
+      rule.endEpoch = 0;
+      setAutomationEndEpoch(rule.id, 0);
+    }
+
+    if (!automationMinuteDue(minuteKey, rule.hour, rule.minute,
+                             rule.lastFired)) {
+      continue;
+    }
+    uint8_t slotIndex = 0;
+    if (!findSwitchSlotByGpio(rule.gpio, slotIndex)) {
+      continue;
+    }
+    applySwitchState(rule.gpio, rule.on);
+    rule.lastFired = minuteKey;
+    setAutomationLastFired(rule.id, minuteKey);
+    if (rule.durationSeconds > 0) {
+      rule.endEpoch = (uint32_t)nowEpoch + rule.durationSeconds;
+      setAutomationEndEpoch(rule.id, rule.endEpoch);
+    }
+    publishAutomationFired(rule, rule.on, "start");
+  }
+}
+#endif
 
 void AtanstackClient::setError(const char* message) {
   _lastError = message == nullptr ? "unknown" : message;
